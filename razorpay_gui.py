@@ -169,12 +169,18 @@ async def check_card_async(browser, card_data):
             await context.close()
             return "LIVE", {"last4": last4, "bin": bin6, "type": f"Paid ₹{amt_paid/100}"}
         
-        if attempts > 0:
+        # attempted + attempts>0 = bank processed the card → LIVE (OTP/3DS pending)
+        if status == "attempted" and attempts > 0:
             await context.close()
-            return "DEAD", {"last4": last4, "bin": bin6, "reason": f"Attempted={attempts}, Status={status}"}
+            return "LIVE", {"last4": last4, "bin": bin6, "type": "Attempted (Bank OK)"}
+        
+        # failed/cancelled = card declined
+        if status in ("failed", "cancelled"):
+            await context.close()
+            return "DEAD", {"last4": last4, "bin": bin6, "reason": f"Status: {status}"}
         
         await context.close()
-        return "UNKNOWN", {"last4": last4, "bin": bin6, "reason": "No clear result"}
+        return "UNKNOWN", {"last4": last4, "bin": bin6, "reason": f"Status: {status}"}
         
     except Exception as e:
         await context.close()
